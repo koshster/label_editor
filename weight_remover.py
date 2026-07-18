@@ -1,154 +1,105 @@
 """
-weight_remover.py — strips the printed dimensions ("DWT: 6,5,5") off a
-Shippo/UPS shipping label PDF, leaving the weight and everything else
-(barcodes, addresses, tracking numbers) untouched.
-
-How it works
-------------
-Shippo's UPS labels are a raster image inside a PDF (no selectable text), so we:
-  1. try the text layer first (some carriers/formats do have one) -> true redaction
-  2. otherwise rasterize the page, OCR it with Tesseract to locate the DWT
-     tokens, paint a white box over just those words, and rebuild the PDF at the
-     original page size/orientation.
-
-Only the matched words get covered. Postage is billed off the manifest/barcode
-data, which is unchanged.
+weight_remover.py — strips the printed weight ("4 LBS", "DWT: 6,5,5") off a
+Shippo/UPS shipping label PDF using RapidOCR (pure Python, no system binaries).
 """
 
 from __future__ import annotations
 
 import io
 import re
-from dataclasses import dataclass
 
 import fitz  # PyMuPDF
-import pytesseract
+import numpy as np
 from PIL import Image, ImageDraw
+from rapidocr_onnxruntime import RapidOCR
 
-# UPS dimensional-weight line, e.g. "DWT: 6,5,5"
-DWT = re.compile(r"^DWT[.:]?$", re.I)
-DWT_FULL = re.compile(r"^DWT[.:]?\s*[\d.,]+$", re.I)
-# guards the DWT digit-merge below from swallowing the actual weight (e.g. "4 LB")
-WEIGHT_UNIT = re.compile(r"^(LBS?|KGS?|OZS?)[.:]?$", re.I)
+# Patterns to match weight tokens
+NUM_UNIT = re.compile(r"^\d{1,4}([.,]\d{1,3})?\s*(LBS?|KGS?|OZS?)[.:]?$", re.I)
+NUM      = re.compile(r"^\d{1,4}([.,]\d{1,3})?$")
+UNIT     = re.compile(r"^(LBS?|KGS?|OZS?)[.:]?$", re.I)
+DWT      = re.compile(r"^DWT[.:]?\s*([\d.,]+)?$", re.I)
 
 RENDER_DPI = 300
-PAD = 4  # px of padding around the whiteout box
+PAD = 6   # px padding around whiteout box
+
+_ocr = None  # lazy singleton
 
 
-@dataclass
-class Box:
-    x0: int
-    y0: int
-    x1: int
-    y1: int
-
-    def union(self, o: "Box") -> "Box":
-        return Box(min(self.x0, o.x0), min(self.y0, o.y0),
-                   max(self.x1, o.x1), max(self.y1, o.y1))
+def _get_ocr() -> RapidOCR:
+    global _ocr
+    if _ocr is None:
+        _ocr = RapidOCR()
+    return _ocr
 
 
-def _ocr_words(img: Image.Image):
-    """Return [(text, Box, line_key, word_idx)] from Tesseract."""
-    data = pytesseract.image_to_data(
-        img, config="--psm 11", output_type=pytesseract.Output.DICT
-    )
-    out = []
-    for i, txt in enumerate(data["text"]):
-        txt = (txt or "").strip()
-        if not txt:
-            continue
-        try:
-            conf = float(data["conf"][i])
-        except (TypeError, ValueError):
-            conf = -1
-        if conf < 40:
-            continue
-        b = Box(data["left"][i], data["top"][i],
-                data["left"][i] + data["width"][i],
-                data["top"][i] + data["height"][i])
-        line_key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        out.append((txt, b, line_key, data["word_num"][i]))
-    return out
+def _bbox_to_box(bbox):
+    """bbox is [[x0,y0],[x1,y0],[x1,y1],[x0,y1]] from RapidOCR."""
+    xs = [p[0] for p in bbox]
+    ys = [p[1] for p in bbox]
+    return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
 
-def _find_weight_boxes(words, include_dwt: bool = True) -> list[Box]:
-    """Match the DWT (dimensions) token and return only its bounding box."""
-    hits: list[Box] = []
-    for i, (txt, box, line, wnum) in enumerate(words):
-        if DWT_FULL.match(txt) and include_dwt:
+def _find_weight_regions(img: Image.Image, include_dwt: bool) -> list[tuple]:
+    """Returns list of (x0, y0, x1, y1) boxes to white out."""
+    ocr = _get_ocr()
+    result, _ = ocr(np.array(img.convert("RGB")))
+    if not result:
+        return []
+
+    hits = []
+    items = [(text, _bbox_to_box(bbox), conf) for bbox, text, conf in result if conf > 0.4]
+
+    for i, (text, box, conf) in enumerate(items):
+        t = text.strip()
+
+        # "4 LBS" or "4LBS" as a single token
+        if NUM_UNIT.match(t):
             hits.append(box)
             continue
-        # "DWT:" followed by the numbers
-        if include_dwt and DWT.match(txt):
-            merged = box
-            for j in range(i + 1, min(i + 4, len(words))):
-                t2, b2, l2, _ = words[j]
-                if l2 != line:
-                    break
-                if re.match(r"^[\d.,]+$", t2):
-                    # a number immediately followed by a weight unit is the
-                    # actual weight, not a dimension digit — stop before it
-                    if j + 1 < len(words):
-                        t3, _, l3, _ = words[j + 1]
-                        if l3 == line and WEIGHT_UNIT.match(t3):
-                            break
-                    merged = merged.union(b2)
-                else:
-                    break
-            hits.append(merged)
+
+        # "DWT: 6,5,5" or "DWT:" standalone
+        if include_dwt and DWT.match(t):
+            hits.append(box)
+            continue
+
+        # Two adjacent tokens: "4" + "LBS"
+        if NUM.match(t):
+            for j in (i + 1, i + 2):
+                if j < len(items):
+                    t2, box2, _ = items[j]
+                    if UNIT.match(t2.strip()):
+                        x0 = min(box[0], box2[0])
+                        y0 = min(box[1], box2[1])
+                        x1 = max(box[2], box2[2])
+                        y1 = max(box[3], box2[3])
+                        hits.append((x0, y0, x1, y1))
+                        break
+
     return hits
 
 
-def _clean_text_layer(page: fitz.Page, include_dwt: bool) -> bool:
-    """If the PDF has real text, redact any DWT match in place. Returns True if
-    this page has a text layer at all (whether or not anything needed redacting),
-    so callers know not to fall back to rasterizing it."""
-    text = page.get_text("text")
-    if not text.strip():
-        return False
-    targets = set()
-    if include_dwt:
-        targets |= set(m.group(0) for m in re.finditer(r"DWT[.:]?\s*[\d.,]+", text, re.I))
-    found = False
-    for t in targets:
-        for rect in page.search_for(t):
-            page.add_redact_annot(rect + (-2, -2, 2, 2), fill=(1, 1, 1))
-            found = True
-    if found:
-        page.apply_redactions()
-    return True
-
-
 def clean_pdf_bytes(pdf_bytes: bytes, include_dwt: bool = True) -> bytes:
-    """Take a label PDF, return the same PDF with the dimensions text whited out."""
+    """Take a label PDF, return same PDF with weight text whited out."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out = fitz.open()
 
     for page in doc:
-        if _clean_text_layer(page, include_dwt):
-            out.insert_pdf(doc, from_page=page.number, to_page=page.number)
-            continue
-
-        # Raster path
         rect = page.rect
         pix = page.get_pixmap(dpi=RENDER_DPI)
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples).convert("RGB")
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
-        # The label art is often rotated 90 deg on the page; try each orientation.
         cleaned = None
         for angle in (0, 90, 180, 270):
             rot = img.rotate(angle, expand=True, fillcolor="white")
-            boxes = _find_weight_boxes(_ocr_words(rot), include_dwt)
+            boxes = _find_weight_regions(rot, include_dwt)
             if boxes:
                 d = ImageDraw.Draw(rot)
-                for b in boxes:
-                    d.rectangle(
-                        [b.x0 - PAD, b.y0 - PAD, b.x1 + PAD, b.y1 + PAD], fill="white"
-                    )
+                for (x0, y0, x1, y1) in boxes:
+                    d.rectangle([x0 - PAD, y0 - PAD, x1 + PAD, y1 + PAD], fill="white")
                 cleaned = rot.rotate(-angle, expand=True, fillcolor="white")
                 break
 
-        if cleaned is None:  # nothing found: pass the page through untouched
+        if cleaned is None:
             out.insert_pdf(doc, from_page=page.number, to_page=page.number)
             continue
 
