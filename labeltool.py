@@ -160,7 +160,8 @@ def cmd_serve(args):
                          as_attachment=True, download_name="label-clean.pdf")
 
     print(f"\n  Open http://localhost:{args.port} in your browser\n")
-    app.run(port=args.port)
+    # app.run(port=args.port) for localhost version
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", args.port)))
 
 
 def main():
